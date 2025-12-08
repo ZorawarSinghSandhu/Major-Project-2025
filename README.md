@@ -19,7 +19,17 @@ Prepare the framework for deployment-ready pipelines
 
 ## 📁 Dataset
 
-We use an openly available clinical dataset containing over 1.5 million hourly records with 40+ physiological variables.
+The clinical dataset used in this project is sourced from PhysioNet, which provides de-identified ICU records for research use.
+
+Dataset Link: https://physionet.org/content/mimiciv/2.2/
+
+⚠️ Due to privacy and licensing restrictions, the full dataset cannot be uploaded to this repository.
+To access the raw files, users must:
+- Create a PhysioNet account
+- Complete the mandatory CITI “Data or Specimens Only Research” training
+- Request and receive official access approval
+
+Only derived features, preprocessing scripts, and sample data segments are shared in this repository.
 
 Key variables include:
 Heart Rate, O2 Saturation, Temperature, Blood Pressure, Respiratory Rate, Creatinine, Bilirubin, Lactate, Platelets, etc.
@@ -33,6 +43,20 @@ Patient_ID (for time-based grouping)
 ICU LOS (ICULOS)
 
 Demographics
+
+### Dataset Dictionary (Key Variables Used)
+| Variable | Meaning |
+|----------|---------|
+| HR | Heart Rate |
+| O2Sat | Oxygen Saturation |
+| Temp | Body Temperature |
+| MAP | Mean Arterial Pressure |
+| Resp | Respiratory Rate |
+| Creatinine | Renal Function Indicator |
+| Platelets | Coagulation Status |
+| SepsisLabel | Binary outcome label |
+| ICULOS | ICU Length of Stay Hourly Counter |
+
 
 ## 🔧 Workflow
 1. Data Preprocessing
