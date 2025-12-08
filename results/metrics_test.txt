@@ -1,0 +1,6 @@
+Accuracy: 0.9341
+Precision: 0.0730
+Recall: 0.2487
+F1: 0.1129
+AUROC: 0.7270
+AUPRC: 0.0535
