@@ -1,0 +1,9 @@
+*.pyc
+__pycache__/
+*.keras
+*.pkl
+*.csv
+*.png
+*.jpg
+.env
+
