@@ -1,0 +1,28 @@
+"demo patient ids retrieved after running find_demo_patients.py"
+
+{
+  "patient_ids": [
+    5233,
+    8297,
+    5462,
+    7017,
+    114864,
+    118572
+  ],
+  "onset_hours": [
+    20,
+    30,
+    40,
+    51,
+    57,
+    70
+  ],
+  "pre_onset_hrs": [
+    20,
+    30,
+    40,
+    51,
+    57,
+    70
+  ]
+}

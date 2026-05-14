@@ -29,27 +29,46 @@ NEGATIVE_MULTIPLIER  = 3
 MAX_COL_MISSING      = 0.70
 MAX_NEG_PER_PATIENT  = 20
 
-
 FOCAL_GAMMA    = 2.0
 FOCAL_ALPHA    = 0.5
 
 
-def load_model():
-    return tf.keras.models.load_model(
-        "sepsis_gru_attention_model.keras",
-        custom_objects={"loss_fn":focal_loss()}
-    )
-    
+# ──────────────────────────────────────────────────────────────────────────────
+# Focal Loss
+# Decorated with @register_keras_serializable so Keras can find it by name
+# when loading a saved .keras file — without this, load_model throws
+# "Could not locate function 'loss_fn'".
+# ──────────────────────────────────────────────────────────────────────────────
+@tf.keras.utils.register_keras_serializable(package="sepsis")
+def focal_loss_fn(y_true, y_pred,
+                  gamma: float = FOCAL_GAMMA,
+                  alpha: float = FOCAL_ALPHA):
+    y_true  = tf.cast(y_true, tf.float32)
+    y_pred  = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+    bce     = (-y_true * tf.math.log(y_pred)
+               - (1 - y_true) * tf.math.log(1 - y_pred))
+    p_t     = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+    alpha_t = y_true * alpha  + (1 - y_true) * (1 - alpha)
+    fl      = alpha_t * tf.pow(1.0 - p_t, gamma) * bce
+    return tf.reduce_mean(fl)
+
+
 def focal_loss(gamma: float = FOCAL_GAMMA, alpha: float = FOCAL_ALPHA):
+    """Returns a configured focal loss function for model.compile()."""
     def loss_fn(y_true, y_pred):
-        y_true  = tf.cast(y_true, tf.float32)
-        y_pred  = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
-        bce     = -y_true * tf.math.log(y_pred) - (1 - y_true) * tf.math.log(1 - y_pred)
-        p_t     = y_true * y_pred + (1 - y_true) * (1 - y_pred)
-        alpha_t = y_true * alpha  + (1 - y_true) * (1 - alpha)
-        fl      = alpha_t * tf.pow(1.0 - p_t, gamma) * bce
-        return tf.reduce_mean(fl)
+        return focal_loss_fn(y_true, y_pred, gamma=gamma, alpha=alpha)
     return loss_fn
+
+
+def load_model():
+    """
+    Load the saved model.  focal_loss_fn is registered via the decorator above,
+    so Keras can find it by name without needing custom_objects.
+    """
+    return tf.keras.models.load_model(
+        "sepsis_gru_attention_model.keras"
+    )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Live simulation
@@ -59,8 +78,19 @@ def simulate_patient_live(
     feature_cols, n_steps=N_STEPS, prediction_window=PREDICTION_WINDOW,
     threshold=0.5, group_col=GROUP, hour_col=HOUR_COL,
     target_col=TARGET, smooth_window=7, min_display_t=MIN_SEQ_T,
+    adaptive_delta=None, baseline_window=(8, 28),
 ):
+    """
+    adaptive_delta: if set (e.g. 0.05), ignore global `threshold` and instead
+        fire an alert when smoothed_risk > patient_baseline + adaptive_delta.
+        patient_baseline = mean of smoothed risk during baseline_window hours.
+        This detects DETERIORATION from each patient's own normal rather than
+        comparing every patient to a global cutoff — more clinically realistic
+        and robust to the model's narrow absolute output range.
 
+    baseline_window: (start_h, end_h) tuple. Use hours after initial padding
+        artefacts settle. Default (8, 28) gives 20h of stable baseline.
+    """
     patient_raw = raw_df[raw_df[group_col] == patient_id].copy()
     if patient_raw.empty:
         print(f"Patient {patient_id} not found.")
@@ -78,7 +108,8 @@ def simulate_patient_live(
     onset_hour = hours[onset_idx]  if onset_idx is not None else None
 
     raw_risks, future_labels = [], []
-    print(f"\n--- Live Simulation: Patient {patient_id} ---")
+    print(f"\n--- Live Simulation: Patient {patient_id} "
+          f"({'SEPTIC onset h=' + str(int(onset_hour)) if onset_hour is not None else 'NON-SEPTIC'}) ---")
 
     for t in range(len(feats)):
         start = max(0, t - n_steps + 1)
@@ -103,25 +134,47 @@ def simulate_patient_live(
     for i in range(1, len(cal_risks)):
         smoothed[i] = a * cal_risks[i] + (1 - a) * smoothed[i - 1]
 
+    # ── Adaptive threshold computation ───────────────────────────────────────
+    if adaptive_delta is not None:
+        bs, be = baseline_window
+        # Find indices where hours fall in baseline window
+        baseline_idx = [i for i, h in enumerate(hours) if bs <= h < be]
+        if len(baseline_idx) >= 3:
+            patient_baseline = float(np.mean([smoothed[i] for i in baseline_idx]))
+        else:
+            # Not enough baseline data — fall back to first 30% of stay
+            n = max(1, len(smoothed) // 3)
+            patient_baseline = float(np.mean(smoothed[:n]))
+        effective_threshold = patient_baseline + adaptive_delta
+        print(f"  Patient baseline (h={baseline_window[0]}-{baseline_window[1]}): "
+              f"{patient_baseline:.4f}  +  delta {adaptive_delta:.3f}  =  "
+              f"effective threshold {effective_threshold:.4f}")
+    else:
+        effective_threshold = threshold
+
     for t in range(len(feats)):
         if t < min_display_t:
             continue
+        alert = smoothed[t] >= effective_threshold
         print(f"Hour {int(hours[t]):3d} | Raw {raw_risks[t]:.3f} | "
               f"Smoothed {smoothed[t]:.3f} | "
               f"Fut{prediction_window}h {future_labels[t]} | "
-              f"{'*** ALERT ***' if smoothed[t] >= threshold else 'OK'}")
+              f"{'*** ALERT ***' if alert else 'OK'}")
 
     sim_df = pd.DataFrame({
-        "Hour": hours, "RawRisk": raw_risks, "CalibratedRisk": cal_risks,
-        "SmoothedRisk": smoothed, "FutureWindowLabel": future_labels,
+        "Hour":               hours,
+        "RawRisk":            raw_risks,
+        "CalibratedRisk":     cal_risks,
+        "SmoothedRisk":       smoothed,
+        "FutureWindowLabel":  future_labels,
         "CurrentSepsisLabel": true_labels,
+        "Alert":              (smoothed >= effective_threshold).astype(int),
     })
 
     # ── Plot ──────────────────────────────────────────────────────────────────
     disp = sim_df[sim_df.index >= min_display_t].copy()
 
     fig, ax = plt.subplots(figsize=(14, 6))
-
     risk_min = max(0.0, disp["SmoothedRisk"].min() - 0.05)
     risk_max = min(1.0, disp["SmoothedRisk"].max() + 0.10)
 
@@ -132,26 +185,31 @@ def simulate_patient_live(
     ax.plot(disp["Hour"], disp["CalibratedRisk"],
             linestyle="--", alpha=0.4, linewidth=1, color="steelblue",
             label="Raw Risk (per hour)")
-    ax.axhline(threshold, color="darkorange", linestyle="--",
-               linewidth=1.8, label=f"Alert Threshold ({threshold:.2f})")
+    thresh_label = (f"Adaptive threshold ({effective_threshold:.2f} = "
+                    f"baseline {patient_baseline:.2f} + Δ{adaptive_delta:.2f})"
+                    if adaptive_delta is not None
+                    else f"Alert Threshold ({effective_threshold:.2f})")
+    ax.axhline(effective_threshold, color="darkorange", linestyle="--",
+               linewidth=1.8, label=thresh_label)
 
     pos_mask = disp["FutureWindowLabel"].values == 1
     if pos_mask.any():
         ax.scatter(disp["Hour"][pos_mask], disp["SmoothedRisk"][pos_mask],
-                   marker="x", s=100, color="darkorange", zorder=5, linewidths=2,
-                   label=f"True pre-sepsis window (next {prediction_window}h)")
+                   marker="x", s=100, color="darkorange", zorder=5,
+                   linewidths=2, label=f"True pre-sepsis window (next {prediction_window}h)")
 
     if onset_hour is not None:
         ax.axvline(onset_hour, color="red", linestyle=":",
                    linewidth=2, label=f"Sepsis Onset (hour {int(onset_hour)})")
-
         ax.axvspan(onset_hour - prediction_window, onset_hour,
-                   alpha=0.08, color="red", label=f"Pre-onset {prediction_window}h window")
+                   alpha=0.08, color="red",
+                   label=f"Pre-onset {prediction_window}h window")
 
     ax.set_ylim(risk_min, risk_max)
     ax.set_xlim(disp["Hour"].min(), disp["Hour"].max() + 1)
-    ax.set_title(f"Live Sepsis Risk — Patient {patient_id}  "
-                 f"(onset h={int(onset_hour) if onset_hour is not None else 'none'})",
+    title_tag = (f"onset h={int(onset_hour)}" if onset_hour is not None
+                 else "NON-SEPTIC")
+    ax.set_title(f"Live Sepsis Risk — Patient {patient_id}  ({title_tag})",
                  fontsize=14, fontweight="bold")
     ax.set_xlabel("Hour in ICU", fontsize=12)
     ax.set_ylabel("Sepsis Risk Probability", fontsize=12)
@@ -168,18 +226,25 @@ def simulate_patient_live(
     if onset_hour is not None:
         first_alert = next(
             (int(hours[t]) for t in range(min_display_t, len(smoothed))
-             if smoothed[t] >= threshold), None
+             if smoothed[t] >= effective_threshold), None
         )
         if first_alert is not None:
             lead = int(onset_hour) - first_alert
             print(f"First alert: hour {first_alert}  "
-                  f"({'%d hours BEFORE onset' % lead if lead > 0 else 'after onset'})")
+                  f"({'%d hours BEFORE onset' % lead if lead > 0 else 'AFTER onset'})")
         else:
             print("No alert triggered before onset.")
+    else:
+        alerts_fired = int((smoothed[min_display_t:] >= effective_threshold).sum())
+        print(f"Non-septic patient: {alerts_fired} false alerts fired "
+              f"out of {len(valid)} hours.")
     return sim_df
 
-class CausalPreprocessor:
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Preprocessor
+# ──────────────────────────────────────────────────────────────────────────────
+class CausalPreprocessor:
 
     ROLL_WINDOWS = [4, 8]
 
@@ -195,55 +260,52 @@ class CausalPreprocessor:
         self.scaler       = None
 
     def _sort(self, df):
-        return df.sort_values([self.group_col, self.hour_col]).reset_index(drop=True)
+        return df.sort_values(
+            [self.group_col, self.hour_col]
+        ).reset_index(drop=True)
 
     def _build_features(self, df):
-
         grp        = df.groupby(self.group_col, sort=False)
         new_frames = []
-
         diffs = grp[self.base_cols].diff().fillna(0.0).astype(np.float32)
         diffs.columns = [f"{c}_diff" for c in self.base_cols]
         new_frames.append(diffs)
-
-
         for w in self.ROLL_WINDOWS:
             roll  = grp[self.base_cols].rolling(window=w, min_periods=1)
-            rmean = roll.mean().reset_index(level=0, drop=True).astype(np.float32)
-            rstd  = roll.std(ddof=0).fillna(0.0).reset_index(level=0, drop=True).astype(np.float32)
+            rmean = (roll.mean().reset_index(level=0, drop=True)
+                     .astype(np.float32))
+            rstd  = (roll.std(ddof=0).fillna(0.0)
+                     .reset_index(level=0, drop=True).astype(np.float32))
             rmean.columns = [f"{c}_rmean{w}" for c in self.base_cols]
             rstd.columns  = [f"{c}_rstd{w}"  for c in self.base_cols]
             new_frames.append(rmean)
             new_frames.append(rstd)
-
         extra = pd.concat(new_frames, axis=1)
         return pd.concat([df, extra], axis=1)
 
     def fit(self, df_train):
-        df       = self._sort(df_train.copy())
-        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        exclude  = {self.target_col, self.group_col, self.hour_col}
+        df        = self._sort(df_train.copy())
+        num_cols  = df.select_dtypes(include=[np.number]).columns.tolist()
+        exclude   = {self.target_col, self.group_col, self.hour_col}
         candidate = [c for c in num_cols if c not in exclude]
-
-        miss_rate      = df[candidate].isna().mean()
-        self.base_cols = [c for c in candidate if miss_rate[c] <= self.max_col_missing]
+        miss_rate = df[candidate].isna().mean()
+        self.base_cols = [c for c in candidate
+                          if miss_rate[c] <= self.max_col_missing]
         if not self.base_cols:
-            raise ValueError("No usable feature columns after missing-rate filtering.")
-
+            raise ValueError("No usable feature columns after filtering.")
         for c in self.base_cols:
             df[c] = df.groupby(self.group_col, sort=False)[c].ffill()
         self.medians = df[self.base_cols].median(numeric_only=True)
         df[self.base_cols] = df[self.base_cols].fillna(self.medians)
-
         df = self._build_features(df)
-
         diff_cols  = [f"{c}_diff"      for c in self.base_cols]
-        roll_cols  = ([f"{c}_rmean{w}" for c in self.base_cols for w in self.ROLL_WINDOWS] +
-                      [f"{c}_rstd{w}"  for c in self.base_cols for w in self.ROLL_WINDOWS])
-        scale_cols = self.base_cols + diff_cols + roll_cols
-
+        roll_cols  = (
+            [f"{c}_rmean{w}" for c in self.base_cols for w in self.ROLL_WINDOWS] +
+            [f"{c}_rstd{w}"  for c in self.base_cols for w in self.ROLL_WINDOWS]
+        )
+        scale_cols        = self.base_cols + diff_cols + roll_cols
         self.feature_cols = scale_cols
-        self.scaler = StandardScaler()
+        self.scaler       = StandardScaler()
         self.scaler.fit(df[scale_cols].astype(np.float32))
         return self
 
@@ -261,7 +323,6 @@ class CausalPreprocessor:
             out[self.feature_cols].astype(np.float32)
         ).astype(np.float32)
         if self.target_col in out.columns:
-            out[self.target_col] = out[self.target_col].fillna(0).astype(np.int32)
+            out[self.target_col] = (out[self.target_col]
+                                    .fillna(0).astype(np.int32))
         return out
-    
-    
